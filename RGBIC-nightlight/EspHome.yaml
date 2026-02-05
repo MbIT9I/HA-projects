@@ -1,0 +1,264 @@
+esphome:
+  name: esp32s3-rgbic
+  friendly_name: ESP32S3 RGBIC
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: rgb_strip
+          brightness: 30%
+          effect: "None"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    version: recommended
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: false  # Сканує всі AP з однаковим SSID
+  power_save_mode: none
+  output_power: 20dB
+  
+  # Налаштування для ESP-IDF (більш агресивне перепідключення)
+  enable_btm: true      # BSS Transition Management
+  enable_rrm: true      # Radio Resource Management
+  
+  # Fallback hotspot
+  ap:
+    ssid: "ESP32-S3-Fallback"
+    password: "12345678"
+  
+  # Подія для логування підключення
+  on_connect:
+    - logger.log: "Connected to WiFi successfully!"
+
+captive_portal:
+
+logger:
+  level: DEBUG  # Детальні логи для діагностики WiFi
+
+web_server:
+  port: 80
+  version: 3
+  log: true  # Показує логи в веб-інтерфейсі
+
+api:
+ota:
+  - platform: esphome
+
+number:
+  - platform: template
+    id: effect_speed
+    name: "LED Effect Speed"
+    min_value: 1
+    max_value: 200      # було 100
+    step: 1
+    initial_value: 120  # вище за замовчуванням
+    restore_value: true
+    optimistic: true
+    icon: mdi:speedometer
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: rgb_strip
+    name: "RGBIC Strip"
+    pin: GPIO38           # за потреби заміни на 39/40/41
+    num_leds: 26          # ← вкажи свою кількість
+    chipset: WS2812       # SK6812/WS2811 — змінюй за фактом
+    rgb_order: BGR        # для SK6812 RGBW: GRBW
+    default_transition_length: 0s
+    gamma_correct: 2.8    # Правильна гамма-корекція для плавного регулювання яскравості
+    color_correct: [100%, 100%, 100%]  # Без корекції кольорів
+    effects:
+      - addressable_lambda:
+          name: "Soft Fill (runner prev→target, 10 colors)"
+          update_interval: 10ms
+          lambda: |-
+            // Швидкість 1..200 зі слайдера
+            const float sp = id(effect_speed).state;
+            int inc = 1 + (int)(sp / 6.0f);     // ~1..34 крок міксу за кадр
+            if (inc < 1) inc = 1; if (inc > 64) inc = 64;
+
+            const int n = it.size();
+            if (n <= 0) return;
+
+            // Палітра 10 кольорів
+            static const Color pal[10] = {
+              Color(255,   0,   0), // red
+              Color(255, 128,   0), // orange
+              Color(255, 255,   0), // yellow
+              Color(  0, 255,   0), // green
+              Color(  0, 255, 255), // cyan
+              Color(  0, 128, 255), // sky
+              Color(  0,   0, 255), // blue
+              Color(128,   0, 255), // violet
+              Color(255,   0, 255), // magenta
+              Color(255,   0, 128)  // pink
+            };
+
+            // Стан: попередній колір, індекс цільового кольору, активний піксель, прогрес міксу
+            static Color prev = Color(0,0,0);   // початково вимкнено
+            static int   idx  = 0;              // індекс у палітрі (цільовий колір)
+            static int   cur  = 0;              // активний піксель (голова)
+            static int   t    = 0;              // 0..255 — ступінь міксу prev→target
+
+            const Color target = pal[idx % 10];
+
+            // 1) Ліворуч від голови — уже перефарбовано в target
+            for (int i = 0; i < cur && i < n; i++) it[i] = target;
+            // 2) Праворуч від (і включно з) голови — ще попередній колір
+            for (int i = cur; i < n; i++) it[i] = prev;
+
+            // 3) Змікшувати активний піксель між prev і target
+            auto mix = [](const Color& a, const Color& b, int tt) -> Color {
+              // tt: 0..255
+              return Color(
+                (uint8_t)(a.r + ((int)b.r - (int)a.r) * tt / 255),
+                (uint8_t)(a.g + ((int)b.g - (int)a.g) * tt / 255),
+                (uint8_t)(a.b + ((int)b.b - (int)a.b) * tt / 255)
+              );
+            };
+
+            Color head = mix(prev, target, t);
+            if (cur < n) it[cur] = head;
+
+            // 4) Оновити прогрес
+            t += inc;
+            if (t >= 255) {
+              // Піксель завершено → стає target
+              if (cur < n) it[cur] = target;
+              cur++;
+              t = 0;
+
+              if (cur >= n) {
+                // Дійшли до кінця: тепер цей target стає "prev" для наступного циклу
+                prev = target;
+                idx = (idx + 1) % 10;   // наступний цільовий колір
+                cur = 0;                // знов із першого пікселя
+                // t вже 0 — готові до нового забігу prev→new target
+              }
+            }
+      - addressable_lambda:
+          name: "Gradient morph (10 colors)"
+          update_interval: 10ms          # було 20ms
+          lambda: |-
+            const float sp = id(effect_speed).state;       // 1..200
+            int step_interval = 40 - (int)(sp * 0.18f);    // ~40..4
+            if (step_interval < 2) step_interval = 2;
+            static int tick = 0;
+            if (++tick % step_interval != 0) return;
+
+            const int n = it.size();
+            if (n == 0) return;
+
+            static const Color pal[10] = {
+              Color(255,   0,   0), // red
+              Color(255, 128,   0), // orange
+              Color(255, 255,   0), // yellow
+              Color(  0, 255,   0), // green
+              Color(  0, 255, 255), // cyan
+              Color(  0, 128, 255), // sky
+              Color(  0,   0, 255), // blue
+              Color(128,   0, 255), // violet
+              Color(255,   0, 255), // magenta
+              Color(255,   0, 128)  // pink
+            };
+
+            static int a = 0, b = 1;
+            static float t = 0.0f;
+            // Швидший прогрес міксу залежно від спідометра
+            float t_step = 0.015f + sp * 0.0006f;  // ~0.015..0.135
+            t += t_step; if (t >= 1.0f) { t = 0.0f; a = b; b = (b + 1) % 7; }
+
+            static float offset = 0.0f;
+            // Швидше прокручування градієнта
+            offset += 0.8f + sp * 0.02f;  // динамічний дрейф
+            if (offset > 100000.0f) offset = 0.0f;
+
+            for (int i = 0; i < n; i++) {
+              float p = (float)i / (float)std::max(1, n - 1);
+              Color c1 = pal[a], c2 = pal[b];
+              float w = 0.5f + 0.5f * sinf((p * 6.28318f) + (offset * 0.015f));
+              float mixT = (t * 0.7f + w * 0.3f);
+              if (mixT < 0.0f) mixT = 0.0f; if (mixT > 1.0f) mixT = 1.0f;
+              it[i] = Color(
+                (uint8_t)(c1.r + (c2.r - c1.r) * mixT),
+                (uint8_t)(c1.g + (c2.g - c1.g) * mixT),
+                (uint8_t)(c1.b + (c2.b - c1.b) * mixT)
+              );
+            }
+      - addressable_rainbow:
+          name: "Static Rainbow"
+          speed: 0
+          width: 26
+      - addressable_lambda:
+          name: "Rainbow (speed from slider)"
+          update_interval: 20ms
+          lambda: |-
+            const int n = it.size();
+            if (n <= 0) return;
+
+            // Та сама "ширина" райдуги
+            const float W = 26.0f;
+
+            // Зчитуємо швидкість (0..200) і перетворюємо у дрібний зсув за кадр
+            const float sp = id(effect_speed).state;   // 0..200
+            const float SPEED_SCALE = 0.5f;            // ← головний редуктор швидкості
+            float delta = (sp <= 0.5f) ? 0.0f : (sp / 200.0f) * SPEED_SCALE;
+            // При sp=200 і SCALE=0.5: ~0.5 hue-од./кадр → ~50/сек → повний цикл ≈ 5.1 c
+            // При sp=100: ~0.25/кадр → цикл ≈ 10.2 c
+
+            // Плаваючий зсув (0..256)
+            static float offset = 0.0f;
+            offset += delta;
+            if (offset >= 256.0f) offset -= 256.0f;
+
+            // Колесо кольорів з плавними переходами та правильною гамма-корекцією
+            auto wheel = [](uint8_t pos) -> Color {
+              // Використовуємо float для точніших обчислень
+              float hue = pos * (360.0f / 255.0f); // Конвертуємо в градуси (0-360)
+              
+              // HSV to RGB з плавними переходами
+              float h = hue;
+              float s = 1.0f; // Повна насиченість
+              float v = 1.0f; // Повна яскравість
+              
+              float c = v * s;
+              float x = c * (1.0f - fabs(fmodf(h / 60.0f, 2.0f) - 1.0f));
+              float m = v - c;
+              
+              float r_f, g_f, b_f;
+              
+              if (h >= 0 && h < 60) {
+                r_f = c; g_f = x; b_f = 0;
+              } else if (h >= 60 && h < 120) {
+                r_f = x; g_f = c; b_f = 0;
+              } else if (h >= 120 && h < 180) {
+                r_f = 0; g_f = c; b_f = x;
+              } else if (h >= 180 && h < 240) {
+                r_f = 0; g_f = x; b_f = c;
+              } else if (h >= 240 && h < 300) {
+                r_f = x; g_f = 0; b_f = c;
+              } else {
+                r_f = c; g_f = 0; b_f = x;
+              }
+              
+              // Додаємо m та конвертуємо у 8-біт з правильним округленням
+              uint8_t r = (uint8_t)((r_f + m) * 255.0f + 0.5f);
+              uint8_t g = (uint8_t)((g_f + m) * 255.0f + 0.5f);
+              uint8_t b = (uint8_t)((b_f + m) * 255.0f + 0.5f);
+              
+              return Color(r, g, b);
+            };
+
+            // Малюємо спектр із потрібною «щільністю» W та зсувом offset
+            for (int i = 0; i < n; i++) {
+              float hue_f = ( (i * 256.0f) / (W <= 0.0f ? 1.0f : W) ) + offset;
+              // нормалізуємо в 0..255
+              uint8_t hue = (uint8_t)fmodf(hue_f, 256.0f);
+              it[i] = wheel(hue);
+            }
